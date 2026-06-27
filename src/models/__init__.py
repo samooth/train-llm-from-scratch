@@ -1,5 +1,13 @@
-# This file makes the 'src.models' directory a Python package.
-from .mlp import MLP
-from .attention import Head, MultiHeadAttention
-from .transformer_block import Block
-from .transformer import Transformer
+from src.models.transformer import Transformer
+from src.models.attention import MultiHeadAttention, Head
+from src.models.transformer_block import Block, RMSNorm
+from src.models.mlp import MLP
+
+__all__ = [
+    'Transformer',
+    'MultiHeadAttention',
+    'Head',
+    'Block',
+    'RMSNorm',
+    'MLP',
+]

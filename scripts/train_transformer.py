@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -30,18 +32,13 @@ def bytes_to_gib(num_bytes: int) -> float:
 
 
 def get_device_report(device: str) -> str:
-    """
-    Build a short report describing the runtime environment: PyTorch/CUDA
-    versions and, when running on a GPU, its name, capability, and total VRAM.
-    This makes it easy to collect comparable training reports across machines.
-    """
+    """Build a short report describing the runtime environment."""
     lines = [
         f"PyTorch version: {torch.__version__}",
         f"Configured device: {device}",
         f"CUDA available: {torch.cuda.is_available()}",
         f"CUDA version: {torch.version.cuda}",
     ]
-
     if device.startswith('cuda') and torch.cuda.is_available():
         device_index = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device_index)
@@ -53,12 +50,11 @@ def get_device_report(device: str) -> str:
         ])
     else:
         lines.append("GPU name: N/A (running without CUDA)")
-
     return "\n".join(lines)
 
 
 def get_peak_memory_report(device: str) -> str:
-    """Report peak GPU memory (allocated/reserved) since the last reset, or N/A on CPU."""
+    """Report peak GPU memory since the last reset, or N/A on CPU."""
     if device.startswith('cuda') and torch.cuda.is_available():
         peak_allocated = bytes_to_gib(torch.cuda.max_memory_allocated())
         peak_reserved = bytes_to_gib(torch.cuda.max_memory_reserved())
@@ -70,17 +66,9 @@ def get_peak_memory_report(device: str) -> str:
 
 
 def estimate_memory_budget(num_params: int, device: str, use_amp: bool) -> str:
-    """
-    Print a rough training VRAM budget so users can predict OOM before launching.
-
-    AdamW keeps fp32 weights + grads + two moment buffers (~16 bytes/param). This is an
-    estimate of optimizer/parameter state only (activations depend on batch/context and
-    are reduced a lot by gradient checkpointing). CUDA-only; returns N/A otherwise.
-    """
+    """Print a rough training VRAM budget so users can predict OOM before launching."""
     if not (device.startswith("cuda") and torch.cuda.is_available()):
         return "VRAM budget: N/A (no CUDA device)"
-    # weights(4) + grad(4) + Adam m(4) + Adam v(4); AMP adds bf16/fp16 copies but keeps
-    # the fp32 master state, so ~16 B/param is a reasonable floor either way.
     state_gib = bytes_to_gib(num_params * 16)
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     total_gib = bytes_to_gib(props.total_memory)
@@ -89,6 +77,32 @@ def estimate_memory_budget(num_params: int, device: str, use_amp: bool) -> str:
         f"VRAM budget: ~{state_gib:.2f} GiB params+optimizer state vs {total_gib:.2f} GiB "
         f"total on {torch.cuda.get_device_name()}{note}"
     )
+
+
+# --- Learning Rate Scheduler ---
+
+def get_lr_with_warmup(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
+    """
+    Linear warmup + cosine decay learning rate schedule.
+
+    Args:
+        step: Current training step (0-indexed).
+        warmup_steps: Number of warmup steps.
+        max_steps: Total training steps.
+        max_lr: Maximum learning rate (after warmup).
+        min_lr: Minimum learning rate (at end of training).
+
+    Returns:
+        Learning rate for the current step.
+    """
+    if step < warmup_steps:
+        # Linear warmup
+        return max_lr * (step + 1) / warmup_steps
+    if step >= max_steps:
+        return min_lr
+    # Cosine decay after warmup
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    return min_lr + (max_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
 
 # --- Checkpoint Helpers ---
@@ -136,12 +150,7 @@ def list_checkpoints(checkpoint_dir: str) -> List[str]:
 
 
 def resolve_resume_path(resume: Optional[str], checkpoint_dir: str) -> Optional[str]:
-    """
-    Resolve a resume argument.
-
-    ``--resume`` with no value uses the latest periodic checkpoint in checkpoint_dir.
-    ``--resume path/to/file.pt`` loads that exact checkpoint.
-    """
+    """Resolve a resume argument."""
     if resume is None:
         return None
     if resume == "latest":
@@ -158,7 +167,16 @@ def current_lr(optimizer: torch.optim.Optimizer) -> float:
 
 
 def lr_for_step(train_config: Dict[str, Any], step: int) -> float:
-    """Return the learning rate that should be active at a given step."""
+    """Return the learning rate for a given step, using warmup if configured."""
+    if train_config.get('t_use_warmup', False):
+        return get_lr_with_warmup(
+            step,
+            warmup_steps=train_config['t_warmup_steps'],
+            max_steps=train_config['t_train_steps'],
+            max_lr=train_config['t_lr'],
+            min_lr=train_config['t_lr_decayed'],
+        )
+    # Legacy step decay
     if step > train_config['t_lr_decay_step']:
         return float(train_config['t_lr_decayed'])
     return float(train_config['t_lr'])
@@ -168,6 +186,50 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     """Set all optimizer parameter groups to the same learning rate."""
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+def configure_optimizer(model: Transformer, train_config: Dict[str, Any]) -> torch.optim.Optimizer:
+    """
+    Configure AdamW optimizer with optional differentiated weight decay.
+
+    When differentiated_weight_decay is True, biases and normalization parameters
+    receive 0 weight decay, while all other parameters receive the configured weight decay.
+    """
+    lr = train_config['t_lr']
+    weight_decay = train_config.get('weight_decay', 0.1)
+    differentiated = train_config.get('differentiated_weight_decay', True)
+
+    fused_available = hasattr(torch.optim.AdamW, '__init__') and 'fused' in torch.optim.AdamW.__init__.__code__.co_varnames
+
+    if differentiated:
+        # Separate parameters that should/shouldn't get weight decay
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Don't apply weight decay to 1D parameters (biases, norms)
+            if param.dim() < 2 or 'bias' in name or 'norm' in name.lower() or 'ln' in name.lower():
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        optimizer_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ]
+    else:
+        optimizer_groups = model.parameters()
+
+    optimizer_kwargs = {
+        'lr': lr,
+        'betas': (0.9, 0.95),
+        'eps': 1e-8,
+    }
+    if fused_available:
+        optimizer_kwargs['fused'] = True
+
+    return torch.optim.AdamW(optimizer_groups, **optimizer_kwargs)
 
 
 def save_training_checkpoint(
@@ -182,19 +244,22 @@ def save_training_checkpoint(
     dev_loss: Optional[float] = None,
     is_final: bool = False,
 ) -> None:
-    """
-    Save model, optimizer, loss history, and LR schedule metadata.
-
-    ``step`` is the last completed zero-based training step, so resume starts at
-    ``step + 1``.
-    """
+    """Save model, optimizer, loss history, and LR schedule metadata."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    # Calculate perplexity if losses available
+    perplexity = None
+    if losses:
+        avg_loss = np.mean(losses[-100:]) if len(losses) >= 100 else np.mean(losses)
+        perplexity = math.exp(avg_loss)
+
     payload = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'losses': losses,
         'train_loss': train_loss,
         'dev_loss': dev_loss,
+        'perplexity': perplexity,
         'step': step,
         'last_completed_step': step,
         'steps': step + 1,
@@ -208,6 +273,7 @@ def save_training_checkpoint(
             'initial_lr': train_config['t_lr'],
             'decayed_lr': train_config['t_lr_decayed'],
             'decay_step': train_config['t_lr_decay_step'],
+            'warmup_steps': train_config.get('t_warmup_steps', 0),
         },
     }
     target_dir = os.path.dirname(path) or "."
@@ -234,12 +300,7 @@ def restore_training_checkpoint(
     train_config: Dict[str, Any],
     device: str,
 ) -> Tuple[int, List[float]]:
-    """
-    Restore model/optimizer state and return ``(next_step, losses)``.
-
-    Older checkpoints did not have ``last_completed_step``. For those, ``steps``
-    is treated as the number of completed optimizer steps.
-    """
+    """Restore model/optimizer state and return (next_step, losses)."""
     checkpoint = load_checkpoint_file(path, device)
     model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -258,9 +319,11 @@ def restore_training_checkpoint(
         set_optimizer_lr(optimizer, lr_for_step(train_config, next_step))
 
     losses = [float(loss) for loss in checkpoint.get('losses', [])]
+    ppl = checkpoint.get('perplexity')
+    ppl_str = f" | Perplexity: {ppl:.2f}" if ppl else ""
     print(
         f"Resumed from {path}. "
-        f"Last completed step: {last_completed_step}. Next step: {next_step}."
+        f"Last completed step: {last_completed_step}. Next step: {next_step}.{ppl_str}"
     )
     return next_step, losses
 
@@ -299,50 +362,69 @@ def as_float(value: Any) -> Optional[float]:
 @torch.no_grad()
 def estimate_loss(model: Transformer, train_config: Dict[str, Any], steps: int) -> Dict[str, float]:
     """
-    Evaluate the model on training and development datasets and calculate average loss.
-
-    Args:
-        model (Transformer): The model being trained.
-        train_config (dict): Training configuration values.
-        steps (int): Number of steps to evaluate.
-
-    Returns:
-        dict: Dictionary containing average losses for 'train' and 'dev' splits.
+    Evaluate the model and calculate average loss and perplexity.
     """
     out = {}
-    model.eval()  # Set the model to evaluation mode.
+    model.eval()
     from data_loader.data_loader import get_batch_iterator
 
     for split in ['train', 'dev']:
-        # Select the appropriate data path for the current split.
         data_path = train_config['train_path'] if split == 'train' else train_config['dev_path']
-
-        # Create a batch iterator for evaluation.
         batch_iterator_eval = get_batch_iterator(
             data_path,
             train_config['t_batch_size'],
             train_config['t_context_length'],
             device=train_config['device'],
         )
-
-        # Track loss values for each evaluation step.
         losses_eval = []
         for _ in range(steps):
             try:
-                # Fetch a batch and calculate the loss.
                 xb, yb = next(batch_iterator_eval)
                 _, loss = model(xb, yb)
                 losses_eval.append(float(loss.item()))
             except StopIteration:
-                # Handle the case where the data iterator ends early.
                 print(f"Warning: Iterator for {split} ended early.")
                 break
 
-        # Compute the mean loss for the current split.
-        out[split] = float(np.mean(losses_eval)) if losses_eval else float("nan")
+        avg_loss = float(np.mean(losses_eval)) if losses_eval else float("nan")
+        out[f'{split}_loss'] = avg_loss
+        out[f'{split}_perplexity'] = math.exp(avg_loss) if avg_loss == avg_loss else float("nan")
 
-    model.train()  # Restore the model to training mode.
+    model.train()
     return out
+
+
+# --- Signal Handling ---
+
+_signal_received = False
+_emergency_checkpoint_path = None
+_emergency_save_fn = None
+
+
+def setup_signal_handler(checkpoint_dir: str, save_fn) -> None:
+    """Setup signal handlers for graceful shutdown on SIGINT/SIGTERM."""
+    global _emergency_checkpoint_path, _emergency_save_fn
+    _emergency_checkpoint_path = os.path.join(checkpoint_dir, "emergency_checkpoint.pt")
+    _emergency_save_fn = save_fn
+
+    def signal_handler(signum, frame):
+        global _signal_received
+        if _signal_received:
+            print("\nForced exit.")
+            sys.exit(1)
+        _signal_received = True
+        print("\n[Signal] Shutdown requested. Saving emergency checkpoint...")
+        try:
+            if _emergency_save_fn is not None:
+                _emergency_save_fn(_emergency_checkpoint_path)
+                print(f"[Signal] Emergency checkpoint saved to {_emergency_checkpoint_path}")
+        except Exception as e:
+            print(f"[Signal] Failed to save emergency checkpoint: {e}")
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def parse_args() -> argparse.Namespace:
@@ -375,20 +457,55 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Keep only the most recent N periodic checkpoints. 0 keeps all.",
     )
-    # --- Memory-optimisation flags (opt-in; all default to the config values, which are OFF) ---
+    # --- Model architecture overrides ---
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout probability (overrides config).",
+    )
+    parser.add_argument(
+        "--norm-type",
+        type=str,
+        choices=["layernorm", "rmsnorm"],
+        default=None,
+        help="Normalization type (overrides config).",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        choices=["gelu", "swiglu"],
+        default=None,
+        help="MLP activation function (overrides config).",
+    )
+    parser.add_argument(
+        "--tie-weights",
+        dest="tie_weights",
+        action="store_true",
+        default=None,
+        help="Enable weight tying (overrides config).",
+    )
+    parser.add_argument(
+        "--no-tie-weights",
+        dest="tie_weights",
+        action="store_false",
+        default=None,
+        help="Disable weight tying (overrides config).",
+    )
+    # --- Memory-optimisation flags ---
     parser.add_argument(
         "--amp",
         dest="amp",
         action="store_true",
         default=None,
-        help="Enable bf16/fp16 mixed-precision autocast (CUDA only; ignored on CPU).",
+        help="Enable bf16/fp16 mixed-precision autocast (CUDA only).",
     )
     parser.add_argument(
         "--amp-dtype",
         type=str,
         choices=["bf16", "fp16"],
         default=None,
-        help="Autocast dtype when --amp is set: bf16 (default, no GradScaler) or fp16.",
+        help="Autocast dtype when --amp is set: bf16 (default) or fp16.",
     )
     parser.add_argument(
         "--grad-checkpointing",
@@ -401,14 +518,48 @@ def parse_args() -> argparse.Namespace:
         "--grad-accum",
         type=int,
         default=None,
-        help="Accumulate gradients over N micro-batches per optimizer step (effective batch xN).",
+        help="Accumulate gradients over N micro-batches per optimizer step.",
     )
     parser.add_argument(
         "--report-memory",
         dest="report_memory",
         action="store_true",
         default=None,
-        help="Print a rough VRAM budget (params + optimizer state) before training (CUDA only).",
+        help="Print a rough VRAM budget before training (CUDA only).",
+    )
+    # --- Training schedule overrides ---
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="Number of warmup steps (overrides config).",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        dest="use_warmup",
+        action="store_false",
+        default=None,
+        help="Disable warmup schedule.",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile",
+        action="store_true",
+        default=None,
+        help="Enable torch.compile() for faster training (PyTorch 2.0+).",
+    )
+    parser.add_argument(
+        "--no-compile",
+        dest="compile",
+        action="store_false",
+        default=None,
+        help="Disable torch.compile().",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="Weight decay for AdamW (overrides config).",
     )
     return parser.parse_args()
 
@@ -416,6 +567,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     train_config = dict(config)
+
+    # Override config with CLI arguments
+    if args.dropout is not None:
+        train_config['dropout'] = args.dropout
+    if args.norm_type is not None:
+        train_config['norm_type'] = args.norm_type
+    if args.activation is not None:
+        train_config['activation'] = args.activation
+    if args.tie_weights is not None:
+        train_config['tie_weights'] = args.tie_weights
+    if args.warmup_steps is not None:
+        train_config['t_warmup_steps'] = args.warmup_steps
+    if args.use_warmup is not None:
+        train_config['t_use_warmup'] = args.use_warmup
+    if args.weight_decay is not None:
+        train_config['weight_decay'] = args.weight_decay
+
     checkpoint_every = (
         args.checkpoint_every
         if args.checkpoint_every is not None
@@ -432,7 +600,7 @@ def main() -> None:
         or default_checkpoint_dir(train_config['t_out_path'])
     )
 
-    # --- Resolve memory-optimisation options (CLI overrides config; all default OFF) ---
+    # Resolve memory-optimisation options
     use_amp = args.amp if args.amp is not None else bool(train_config.get('use_amp', False))
     amp_dtype_name = args.amp_dtype or train_config.get('amp_dtype', 'bf16')
     use_grad_ckpt = (
@@ -444,6 +612,10 @@ def main() -> None:
     report_memory = (
         args.report_memory if args.report_memory is not None
         else bool(train_config.get('report_memory_budget', False))
+    )
+    use_compile = (
+        args.compile if args.compile is not None
+        else bool(train_config.get('use_torch_compile', False))
     )
 
     device_is_cuda = train_config['device'].startswith('cuda') and torch.cuda.is_available()
@@ -457,14 +629,10 @@ def main() -> None:
             return torch.autocast(device_type='cuda', dtype=amp_dtype)
         return contextlib.nullcontext()
 
-    # GradScaler is only needed for fp16; bf16 has enough range. A disabled scaler is a no-op,
-    # so the scale/unscale_/step/update calls below work unchanged for bf16 and CPU.
     use_scaler = use_amp and amp_dtype == torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
-    # --- Initialize the Model and Print Parameters ---
-
-    # Print runtime/device diagnostics and reset GPU peak-memory stats before training.
+    # --- Initialize the Model ---
     print(get_device_report(train_config['device']))
     if train_config['device'].startswith('cuda') and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -475,29 +643,44 @@ def main() -> None:
         context_length=train_config['context_length'],
         vocab_size=train_config['vocab_size'],
         N_BLOCKS=train_config['n_blocks'],
+        dropout=train_config.get('dropout', 0.0),
+        norm_type=train_config.get('norm_type', 'layernorm'),
+        activation=train_config.get('activation', 'gelu'),
+        tie_weights=train_config.get('tie_weights', True),
     ).to(train_config['device'])
 
-    # Print the total number of parameters.
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total number of parameters in the model: {total_params:,}")
+    # torch.compile (PyTorch 2.0+)
+    if use_compile and hasattr(torch, 'compile'):
+        print("[optim] torch.compile() enabled.")
+        model = torch.compile(model)
+    elif use_compile:
+        print("[optim] torch.compile() requested but not available (requires PyTorch 2.0+).")
 
-    # Apply opt-in memory optimisations.
+    total_params = model.get_num_params(non_embedding=False)
+    non_emb_params = model.get_num_params(non_embedding=True)
+    print(f"Total parameters: {total_params:,} (~{total_params/1e6:.0f}M)")
+    print(f"Non-embedding parameters: {non_emb_params:,} (~{non_emb_params/1e6:.0f}M)")
+    if train_config.get('tie_weights', True):
+        print(f"[optim] Weight tying enabled (saved ~{train_config['vocab_size'] * train_config['n_embed'] / 1e6:.0f}M parameters)")
+
     model.gradient_checkpointing = use_grad_ckpt
     if report_memory:
         print(estimate_memory_budget(total_params, train_config['device'], use_amp))
-    if use_amp or use_grad_ckpt or grad_accum > 1:
-        print(
-            f"[mem-opt] amp={use_amp}"
-            f"{'(' + amp_dtype_name + ')' if use_amp else ''} "
-            f"grad_checkpointing={use_grad_ckpt} grad_accum={grad_accum}"
-        )
+    if use_amp or use_grad_ckpt or grad_accum > 1 or use_compile:
+        opts = []
+        if use_amp:
+            opts.append(f"amp({amp_dtype_name})")
+        if use_grad_ckpt:
+            opts.append("grad_ckpt")
+        if grad_accum > 1:
+            opts.append(f"grad_accum={grad_accum}")
+        if use_compile:
+            opts.append("torch.compile")
+        print(f"[mem-opt] {' | '.join(opts)}")
 
-    # --- Optimizer Setup and Loss Tracking ---
+    # --- Optimizer Setup ---
+    optimizer = configure_optimizer(model, train_config)
 
-    # Set up the AdamW optimizer with the specified learning rate.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config['t_lr'])
-
-    # List to track loss values during training.
     losses: List[float] = []
     start_step = 0
     last_completed_step = -1
@@ -512,14 +695,23 @@ def main() -> None:
         )
         last_completed_step = start_step - 1
 
-    # Define a window size for averaging recent losses in the training loop.
     avg_window = 64
 
-    # --- Training Loop ---
+    # --- Signal Handler ---
+    if train_config.get('enable_signal_handler', True):
+        def emergency_save(path):
+            save_training_checkpoint(
+                path, model, optimizer, train_config, losses,
+                step=last_completed_step,
+                train_loss=None,
+                dev_loss=None,
+            )
+        setup_signal_handler(checkpoint_dir, emergency_save)
+        print("[safety] Signal handler enabled (SIGINT/SIGTERM -> emergency checkpoint)")
 
+    # --- Training Loop ---
     from data_loader.data_loader import get_batch_iterator
 
-    # Create a batch iterator for the training data.
     batch_iterator = get_batch_iterator(
         train_config['train_path'],
         train_config['t_batch_size'],
@@ -527,36 +719,48 @@ def main() -> None:
         device=train_config['device'],
     )
 
-    # Number of tokens processed per optimizer step (batch * context * grad_accum), for throughput.
     tokens_per_step = train_config['t_batch_size'] * train_config['t_context_length'] * grad_accum
     last_eval_time = time.perf_counter()
     latest_train_loss = None
     latest_dev_loss = None
+    latest_perplexity = None
 
-    # Create a progress bar to monitor training progress.
+    use_warmup = train_config.get('t_use_warmup', False)
+    if use_warmup:
+        print(f"[schedule] Warmup + Cosine Decay: {train_config['t_warmup_steps']} warmup steps, "
+              f"LR: {train_config['t_lr']:.2e} -> {train_config['t_lr_decayed']:.2e}")
+
     pbar = tqdm(range(start_step, train_config['t_train_steps']))
     for step in pbar:
+        # Handle signals
+        global _signal_received
+        if _signal_received:
+            break
+
         try:
-            # Start the step timer.
             step_start_time = time.perf_counter()
 
-            # Accumulate gradients over `grad_accum` micro-batches (==1 => original behaviour).
+            # Update learning rate
+            lr = lr_for_step(train_config, step)
+            set_optimizer_lr(optimizer, lr)
+
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             for _ in range(grad_accum):
                 xb, yb = next(batch_iterator)
                 with autocast_ctx():
                     _, loss = model(xb, yb)
-                    # Scale so the accumulated gradient equals the full-batch mean gradient.
                     loss = loss / grad_accum
                 scaler.scale(loss).backward()
                 step_loss += float(loss.item())
 
-            # Record the (accumulated) loss for tracking.
             losses.append(step_loss)
-            pbar.set_description(f"Train loss: {np.mean(losses[-avg_window:]):.4f}")
+            avg_loss = np.mean(losses[-avg_window:]) if len(losses) >= avg_window else np.mean(losses)
+            pbar.set_description(
+                f"loss: {avg_loss:.4f} | lr: {lr:.2e}"
+                + (f" | ppl: {math.exp(avg_loss):.1f}" if avg_loss == avg_loss else "")
+            )
 
-            # Clip gradients to prevent exploding gradients (unscale first for fp16 AMP).
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -564,28 +768,32 @@ def main() -> None:
             scaler.update()
             last_completed_step = step
 
-            # Measure step time and instantaneous throughput for diagnostics.
             step_time = time.perf_counter() - step_start_time
             tokens_per_second = tokens_per_step / step_time if step_time > 0 else float('inf')
 
-            # Periodically evaluate the model on training and development data.
             if step % train_config['t_eval_steps'] == 0:
                 evaluation_losses = estimate_loss(model, train_config, train_config['t_eval_iters'])
-                latest_train_loss = evaluation_losses['train']
-                latest_dev_loss = evaluation_losses['dev']
-                # Report timing/throughput for the most recent step and wall-time since last eval.
+                latest_train_loss = evaluation_losses['train_loss']
+                latest_dev_loss = evaluation_losses['dev_loss']
+                latest_perplexity = evaluation_losses['train_perplexity']
+
                 now = time.perf_counter()
                 elapsed_since_eval = now - last_eval_time
                 last_eval_time = now
+
                 print(
-                    f"Step: {step}, Train loss: {latest_train_loss:.4f}, Dev loss: {latest_dev_loss:.4f}, "
-                    f"Step time: {step_time:.3f}s, Throughput: {tokens_per_second:.2f} tokens/s, "
-                    f"Elapsed since last eval: {elapsed_since_eval:.2f}s"
+                    f"\nStep: {step} | "
+                    f"Train loss: {latest_train_loss:.4f} (PPL: {latest_perplexity:.2f}) | "
+                    f"Dev loss: {latest_dev_loss:.4f} (PPL: {evaluation_losses['dev_perplexity']:.2f}) | "
+                    f"LR: {lr:.2e} | "
+                    f"Step time: {step_time:.3f}s | "
+                    f"Throughput: {tokens_per_second:.2f} tokens/s | "
+                    f"Elapsed: {elapsed_since_eval:.2f}s"
                 )
                 print(get_peak_memory_report(train_config['device']))
 
-            # Decay the learning rate at the specified step.
-            if step == train_config['t_lr_decay_step']:
+            # Legacy LR decay (only if not using warmup)
+            if not use_warmup and step == train_config['t_lr_decay_step']:
                 print('Decaying learning rate')
                 set_optimizer_lr(optimizer, train_config['t_lr_decayed'])
 
@@ -604,22 +812,19 @@ def main() -> None:
                 prune_old_checkpoints(checkpoint_dir, int(keep_last or 0))
                 print(f"Saved checkpoint to {path}")
         except StopIteration:
-            # Handle the case where the training data iterator ends early.
             print("Training data iterator finished early.")
             break
 
     # --- Save Model and Final Evaluation ---
-
-    # Perform a final evaluation of the model on training and development datasets.
     evaluation_losses = estimate_loss(model, train_config, 200)
-    train_loss = evaluation_losses['train']
-    dev_loss = evaluation_losses['dev']
+    train_loss = evaluation_losses['train_loss']
+    dev_loss = evaluation_losses['dev_loss']
+    train_ppl = evaluation_losses['train_perplexity']
+    dev_ppl = evaluation_losses['dev_perplexity']
 
     final_step = max(last_completed_step, start_step - 1)
     modified_model_out_path = unique_output_path(train_config['t_out_path'])
 
-    # Save the model's state dictionary, optimizer state, and training metadata
-    # (including the runtime device / PyTorch / CUDA versions for reproducibility).
     save_training_checkpoint(
         modified_model_out_path,
         model,
@@ -629,11 +834,15 @@ def main() -> None:
         step=final_step,
         train_loss=train_loss,
         dev_loss=dev_loss,
-        is_final=True,
     )
+    print(f"\n{'='*60}")
     print(f"Saved model to {modified_model_out_path}")
+    print(f"Final Results:")
+    print(f"  Train loss: {train_loss:.4f} | Perplexity: {train_ppl:.2f}")
+    print(f"  Dev loss:   {dev_loss:.4f} | Perplexity: {dev_ppl:.2f}")
+    print(f"  Total steps: {final_step + 1}")
+    print(f"{'='*60}")
     print(get_peak_memory_report(train_config['device']))
-    print(f"Finished training. Train loss: {train_loss:.4f}, Dev loss: {dev_loss:.4f}")
 
 
 if __name__ == "__main__":
